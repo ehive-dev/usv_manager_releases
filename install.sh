@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # usv-manager Installer/Updater (DietPi / Debian)
 # Main functions:
-# - apt_update_once: apt-get update genau einmal (robust, non-interactive)
-# - need_tools: curl/jq/dpkg/systemctl sicherstellen
-# - api/get_release_json/pick_deb_from_release: passendes .deb aus GitHub Releases wählen (stable/pre, optional tag)
-# - ensure_python_gpiod: Bookworm-fix ohne Locale-Parsing (install-try + Fallback python3-libgpiod <-> python3-gpiod)
+# - apt_update_once: führt apt-get update genau einmal aus (non-interactive)
+# - need_tools: stellt sicher, dass curl/jq/dpkg/dpkg-deb/systemctl vorhanden sind
+# - api/get_release_json/pick_deb_from_release: ermittelt das passende .deb aus GitHub Releases (stable/pre, optional tag)
+# - ensure_python_gpiod: Bookworm-fix (Candidate-Check) + installiert python3-libgpiod (+ libgpiod2 + gpiod) statt python3-gpiod
+# - patch_deb_dep_if_needed: patcht .deb "Depends: python3-gpiod" -> "python3-libgpiod | python3-gpiod" (Workaround für alte Releases)
 # - ensure_unit_exists/ensure_defaults_file: systemd Unit + /etc/default non-destructive bereitstellen
 # - wait_service_active: prüft, ob der Dienst aktiv ist
 
@@ -13,7 +14,7 @@ umask 022
 
 APP_NAME="usv-manager"
 UNIT="${APP_NAME}.service"
-UNIT_BASE="usv-manager"
+UNIT_BASE="${APP_NAME}"
 
 # Non-interactive APT (keine Rückfragen)
 export DEBIAN_FRONTEND=noninteractive
@@ -23,19 +24,12 @@ APT_INSTALL_OPTS=(
   -o Dpkg::Options::=--force-confold
 )
 
-# Defaults (override via env or CLI)
-# WICHTIG: setze hier dein echtes Releases-Repo (owner/repo)!
-REPO="${REPO:-ehive-dev/usv_manager_releases}"
-CHANNEL="stable"     # stable | pre
+# Defaults (can be overridden via env or CLI)
+REPO="${REPO:-ehive-dev/usv_manager_releases}" # releases repo
+CHANNEL="stable"                               # stable | pre
 TAG="${TAG:-}"
 ARCH_REQ="arm64"
-
-# Paketname (dpkg-query) – falls dein .deb anders heißt, per ENV überschreiben:
-#   DPKG_PKG=usv-manager
-DPKG_PKG="${DPKG_PKG:-usv-manager}"
-
-# Asset-Name Patterns (falls dein .deb anders heißt, per ENV überschreiben)
-ASSET_PREFIX_RE="${ASSET_PREFIX_RE:-usv-manager|usv_manager|usvManager|usvmanager}"
+DPKG_PKG="${DPKG_PKG:-$APP_NAME}"
 
 # ---------- CLI args ----------
 while [[ $# -gt 0 ]]; do
@@ -67,17 +61,18 @@ need_root(){
 
 apt_update_once(){
   if [[ "${_APT_UPDATED:-0}" != "1" ]]; then
-    # robust: nicht an 3rd-party Repo-Warnungen sterben
-    apt-get update || true
+    apt-get update
     _APT_UPDATED=1
   fi
 }
 
 need_tools(){
-  command -v curl >/dev/null || { apt_update_once; apt-get install "${APT_INSTALL_OPTS[@]}" curl; }
-  command -v jq   >/dev/null || { apt_update_once; apt-get install "${APT_INSTALL_OPTS[@]}" jq; }
-  command -v dpkg >/dev/null || { apt_update_once; apt-get install "${APT_INSTALL_OPTS[@]}" dpkg; }
+  command -v curl     >/dev/null || { apt_update_once; apt-get install "${APT_INSTALL_OPTS[@]}" curl; }
+  command -v jq       >/dev/null || { apt_update_once; apt-get install "${APT_INSTALL_OPTS[@]}" jq; }
+  command -v dpkg     >/dev/null || { apt_update_once; apt-get install "${APT_INSTALL_OPTS[@]}" dpkg; }
+  command -v dpkg-deb >/dev/null || { apt_update_once; apt-get install "${APT_INSTALL_OPTS[@]}" dpkg; }
   command -v systemctl >/dev/null || { err "systemd/systemctl erforderlich."; exit 1; }
+  command -v ss >/dev/null 2>&1 || true
 }
 
 # Use GitHub API with optional token (GITHUB_TOKEN or GH_TOKEN)
@@ -104,55 +99,85 @@ get_release_json(){
 }
 
 pick_deb_from_release(){
-  # 1) bevorzugt _arm64.deb, 2) fallback _all.deb
-  local re_arm="^(${ASSET_PREFIX_RE})_.*_${ARCH_REQ}\\.deb$"
-  local re_all="^(${ASSET_PREFIX_RE})_.*_all\\.deb$"
-
-  jq -r --arg re_arm "$re_arm" --arg re_all "$re_all" '
+  # Accepts:
+  # - usv-manager_<ver>_arm64.deb
+  # - usv-manager_<ver>_all.deb (allowed fallback)
+  jq -r --arg arch "$ARCH_REQ" --arg app "$APP_NAME" '
     .assets // []
-    | ( map(select(.name | test($re_arm;"i"))) + map(select(.name | test($re_all;"i"))) )
+    | ( map(select(.name | test("^" + $app + "_.*_" + $arch + "\\.deb$")))
+      + map(select(.name | test("^" + $app + "_.*_all\\.deb$"))) )
     | .[0].browser_download_url // empty
   '
 }
 
 installed_version(){ dpkg-query -W -f='${Version}\n' "$DPKG_PKG" 2>/dev/null || true; }
 
+pkg_candidate(){
+  local pkg="$1"
+  apt-cache policy "$pkg" 2>/dev/null | awk -F': ' '/Candidate:/{print $2; exit 0}'
+}
+
 ensure_python_gpiod(){
   apt_update_once
 
-  # Basis
-  apt-get install "${APT_INSTALL_OPTS[@]}" python3 iproute2 >/dev/null 2>&1 || true
-
-  # wenn schon installiert: ok
-  if dpkg -s python3-libgpiod >/dev/null 2>&1; then
-    apt-get install "${APT_INSTALL_OPTS[@]}" libgpiod2 gpiod >/dev/null 2>&1 || true
-    return 0
-  fi
-  if dpkg -s python3-gpiod >/dev/null 2>&1; then
+  # python3-gpiod nur installieren, wenn wirklich ein Candidate existiert (Bookworm oft: (none))
+  local cand
+  cand="$(pkg_candidate python3-gpiod || true)"
+  if [[ -n "${cand:-}" && "${cand:-}" != "(none)" ]]; then
+    apt-get install "${APT_INSTALL_OPTS[@]}" python3 python3-gpiod iproute2
     return 0
   fi
 
-  # Bookworm: python3-libgpiod
-  set +e
-  apt-get install "${APT_INSTALL_OPTS[@]}" python3-libgpiod libgpiod2 gpiod >/dev/null 2>&1
-  local rc=$?
-  set -e
-  if [[ $rc -eq 0 ]]; then
+  # Bookworm-Standard: python3-libgpiod (+ libgpiod2 + gpiod)
+  cand="$(pkg_candidate python3-libgpiod || true)"
+  if [[ -n "${cand:-}" && "${cand:-}" != "(none)" ]]; then
+    apt-get install "${APT_INSTALL_OPTS[@]}" python3 python3-libgpiod libgpiod2 gpiod iproute2
     return 0
   fi
 
-  # ältere Distros: python3-gpiod
-  set +e
-  apt-get install "${APT_INSTALL_OPTS[@]}" python3-gpiod >/dev/null 2>&1
-  rc=$?
-  set -e
-  if [[ $rc -eq 0 ]]; then
-    return 0
-  fi
-
-  err "Kein passendes Paket gefunden: python3-libgpiod ODER python3-gpiod."
-  err "Debug: apt-cache search gpiod | grep -E 'python3|libgpiod'"
+  err "Kein passendes Paket gefunden: python3-gpiod (Candidate) ODER python3-libgpiod (Candidate)."
+  err "Fix: apt-cache search gpiod | grep python3  (oder Repo/Distribution prüfen)"
   exit 1
+}
+
+patch_deb_dep_if_needed(){
+  # Workaround für alte .deb, die "Depends: python3-gpiod" hardcoden (Bookworm: nicht installierbar)
+  local deb_in="$1"
+
+  local depends
+  depends="$(dpkg-deb -f "$deb_in" Depends 2>/dev/null || true)"
+
+  # nur patchen wenn wirklich python3-gpiod verlangt wird
+  if ! printf '%s' "$depends" | grep -qE '(^|[,[:space:]])python3-gpiod($|[,[:space:]])'; then
+    echo "$deb_in"
+    return 0
+  fi
+
+  # nur patchen wenn python3-gpiod NICHT installierbar ist, aber python3-libgpiod schon
+  local cand_gpiod cand_lib
+  cand_gpiod="$(pkg_candidate python3-gpiod || true)"
+  cand_lib="$(pkg_candidate python3-libgpiod || true)"
+  if [[ -n "${cand_gpiod:-}" && "${cand_gpiod:-}" != "(none)" ]]; then
+    echo "$deb_in"
+    return 0
+  fi
+  if [[ -z "${cand_lib:-}" || "${cand_lib:-}" == "(none)" ]]; then
+    err "Paket hängt von python3-gpiod ab, aber weder python3-gpiod noch python3-libgpiod ist installierbar."
+    exit 1
+  fi
+
+  warn "Patch: .deb Depends python3-gpiod → python3-libgpiod | python3-gpiod (Bookworm Fix)"
+
+  local work out
+  work="$(mktemp -d -t usv-debpatch.XXXXX)"
+  out="${work}/patched.deb"
+
+  dpkg-deb -R "$deb_in" "${work}/root"
+  # robust: ersetze nur das Paket-Token, nicht irgendwelche Teilstrings
+  sed -i -E 's/(^Depends:.*)(^|[,[:space:]])python3-gpiod([,[:space:]]|$)/\1 python3-libgpiod | python3-gpiod\3/I' "${work}/root/DEBIAN/control" || true
+  dpkg-deb -b "${work}/root" "$out" >/dev/null 2>&1 || { rm -rf "$work"; err "Repack des gepatchten .deb fehlgeschlagen."; exit 1; }
+
+  echo "$out"
 }
 
 wait_service_active(){
@@ -164,37 +189,12 @@ wait_service_active(){
   return 1
 }
 
-ensure_wrapper_exec(){
-  local wrapper="/usr/local/bin/usv-manager-wrapper"
-  if [[ -x "$wrapper" ]]; then
-    echo "$wrapper"
-    return 0
-  fi
-
-  cat >"$wrapper" <<'WRAP'
-#!/usr/bin/env bash
-set -euo pipefail
-for p in /usr/local/bin/usv-manager /usr/local/bin/usvManager /usr/bin/usv-manager /usr/bin/usvManager; do
-  if [[ -x "$p" ]]; then
-    exec "$p" "$@"
-  fi
-done
-echo "usv-manager binary not found in /usr/local/bin or /usr/bin" >&2
-exit 127
-WRAP
-  chmod 755 "$wrapper"
-  echo "$wrapper"
-}
-
 ensure_unit_exists(){
   if systemctl list-unit-files | awk '{print $1}' | grep -qx "${UNIT}"; then
     return 0
   fi
 
   warn "Keine Unit-Datei im System gefunden (${UNIT}) — lege Minimal-Unit an."
-  local exec_path
-  exec_path="$(ensure_wrapper_exec)"
-
   local unit_path="/etc/systemd/system/${UNIT}"
   cat >"$unit_path" <<UNITFILE
 [Unit]
@@ -207,7 +207,7 @@ Type=simple
 User=root
 Group=root
 EnvironmentFile=-/etc/default/${APP_NAME}
-ExecStart=${exec_path}
+ExecStart=/usr/local/bin/${APP_NAME}
 Restart=always
 RestartSec=1s
 StateDirectory=${UNIT_BASE}
@@ -226,12 +226,11 @@ ensure_defaults_file(){
   fi
   install -D -m 644 /dev/null "/etc/default/${APP_NAME}"
   cat >>"/etc/default/${APP_NAME}" <<EOF
-# usv-manager defaults (optional)
+# usv-manager defaults (example)
 USV_CHIP=/dev/gpiochip3
-USV_OUT_LINE_A=2
-USV_OUT_LINE_B=5
+USV_OUT1_LINE=2
+USV_OUT2_LINE=5
 USV_IN_LINE=11
-USV_ACTIVE_LOW=0
 EOF
 }
 
@@ -241,8 +240,7 @@ need_tools
 
 ARCH_SYS="$(dpkg --print-architecture 2>/dev/null || echo unknown)"
 if [[ "$ARCH_SYS" != "$ARCH_REQ" ]]; then
-  warn "Systemarchitektur '$ARCH_SYS', Releases sind für '$ARCH_REQ'."
-  exit 1
+  warn "Systemarchitektur '$ARCH_SYS', Ziel ist '$ARCH_REQ'. (all.deb ist trotzdem ok)"
 fi
 
 OLD_VER="$(installed_version || true)"
@@ -260,7 +258,7 @@ RELEASE_JSON="$(get_release_json || true)"
 
 if [[ -z "${RELEASE_JSON:-}" || "${RELEASE_JSON:-}" == "null" ]]; then
   err "Keine passende Release gefunden oder API-Fehler."
-  err "Tipp: export GITHUB_TOKEN=\$(gh auth token)"
+  err "Tipp: export GITHUB_TOKEN=\$(gh auth token)  (bei 403/rate limit/private repo)"
   exit 1
 fi
 
@@ -272,26 +270,31 @@ DEB_URL_RAW="$(printf '%s' "$RELEASE_JSON" | pick_deb_from_release || true)"
 DEB_URL="$(printf '%s' "$DEB_URL_RAW" | trim_one_line)"
 [[ -z "$DEB_URL" ]] && { err "Kein .deb Asset (arm64/all) in Release ${TAG} gefunden."; exit 1; }
 
-TMPDIR="$(mktemp -d -t usv-manager-install.XXXXX)"
+TMPDIR="$(mktemp -d -t usv-install.XXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT
-DEB_FILE="${TMPDIR}/${APP_NAME}_${VER_CLEAN}_${ARCH_REQ}.deb"
+
+DEB_FILE="${TMPDIR}/$(basename "$DEB_URL")"
 
 info "Lade: ${DEB_URL}"
 curl -fL --retry 3 --retry-delay 1 -o "$DEB_FILE" "$DEB_URL"
 dpkg-deb --info "$DEB_FILE" >/dev/null 2>&1 || { err "Ungültiges .deb"; exit 1; }
 
+# Stop service if present
 systemctl stop "$UNIT" >/dev/null 2>&1 || true
+
+# Patch .deb dependency if needed (old releases)
+DEB_INSTALL="$(patch_deb_dep_if_needed "$DEB_FILE")"
 
 info "Installiere Paket ..."
 set +e
-dpkg -i "$DEB_FILE"
+dpkg -i "$DEB_INSTALL"
 RC=$?
 set -e
 if [[ $RC -ne 0 ]]; then
   warn "dpkg -i scheiterte — versuche apt --fix-broken"
   apt_update_once
   apt-get -f install "${APT_INSTALL_OPTS[@]}"
-  dpkg -i "$DEB_FILE"
+  dpkg -i "$DEB_INSTALL"
 fi
 ok "Installiert: ${DPKG_PKG} ${VER_CLEAN}"
 
