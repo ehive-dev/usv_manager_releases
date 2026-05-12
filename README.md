@@ -1,12 +1,12 @@
 # usv-manager Releases
 
-Dieses Repository enthaelt oeffentliche Release-Pakete fuer usv-manager.
+Dieses Repository enthält öffentliche Release-Pakete für usv-manager.
 
 ## Schnellstart
 
-Hinweis: Der Installer in diesem Repository ist aktuell bewusst deaktiviert und ueberspringt die Installation, weil `usv-manager` derzeit nicht Bestandteil des SmartHub-Stacks ist.
+Hinweis: Der Installer in diesem Repository ist aktuell bewusst deaktiviert und überspringt die Installation, weil `usv-manager` derzeit nicht Bestandteil des SmartHub-Stacks ist.
 
-Installer ausfuehren und Hinweis anzeigen:
+Installer ausführen und Hinweis anzeigen:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ehive-dev/usv_manager_releases/main/install.sh | sudo bash
@@ -32,4 +32,4 @@ journalctl -u usv-manager -f
 
 ## Lizenz
 
-Die Nutzung ist fuer private und nicht-kommerzielle Zwecke erlaubt. Kommerzielle Nutzung benoetigt eine vorherige schriftliche Zustimmung von ehive. Siehe `LICENSE.txt` und `THIRD_PARTY_NOTICES.txt`.
+Die Nutzung ist für private und nicht-kommerzielle Zwecke erlaubt. Kommerzielle Nutzung benötigt eine vorherige schriftliche Zustimmung von ehive. Siehe `LICENSE.txt` und `THIRD_PARTY_NOTICES.txt`.
